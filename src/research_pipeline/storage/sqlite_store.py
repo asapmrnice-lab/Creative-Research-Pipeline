@@ -176,6 +176,49 @@ class SqliteStore:
         self._conn.commit()
         return True
 
+    # -- human input, from the review interface -----------------------------
+
+    def add_note(self, item_id: int, body: str) -> int:
+        """Record a human note. Nothing automated may call this.
+
+        The note table's CHECK constrains author to 'human', so an automated
+        writer cannot quietly file its output as analysis.
+        """
+        body = body.strip()
+        if not body:
+            raise ValueError("a note needs a body")
+        self._require_item(item_id)
+        cur = self._conn.execute(
+            "INSERT INTO note (research_item_id, body) VALUES (?, ?)", (item_id, body)
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def add_field(self, item_id: int, name: str, value: str) -> int:
+        """Record a manually-observed Structured Field, marked origin='human'.
+
+        Provenance is the whole point: a field added here is distinguishable
+        forever from one a model produced.
+        """
+        name, value = name.strip(), value.strip()
+        if not name or not value:
+            raise ValueError("a field needs both a name and a value")
+        self._require_item(item_id)
+        cur = self._conn.execute(
+            "INSERT INTO structured_field (research_item_id, name, value, origin) "
+            "VALUES (?, ?, ?, 'human')",
+            (item_id, name, value),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def _require_item(self, item_id: int) -> None:
+        exists = self._conn.execute(
+            "SELECT 1 FROM research_item WHERE id = ?", (item_id,)
+        ).fetchone()
+        if exists is None:
+            raise KeyError(f"no research item with id {item_id}")
+
     # -- read-only helpers, for the CLI and for tests ----------------------
 
     def count_items(self) -> int:
