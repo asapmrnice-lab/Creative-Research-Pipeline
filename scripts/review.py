@@ -13,23 +13,29 @@ the part you sit in front of.
     python scripts/review.py field 12 geo UA
     python scripts/review.py export             # CSV snapshot for Excel
 
-Reads go through a read-only connection; the two writing commands go through
-SqliteStore, which remains the only writer in the system.
+Reads go through a read-only store; the two writing commands go through the
+annotation store, which records everything it writes as origin='human'. Which
+backend answers -- SQLite or Supabase -- is decided by config.py, not here.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from research_pipeline.config import (  # noqa: E402
+    ConfigError,
+    StorageConfig,
+    open_annotation_store,
+    open_read_store,
+)
 from research_pipeline.env import load_project_env  # noqa: E402
-from research_pipeline.storage.reader import ItemDetail, ResearchStoreReader  # noqa: E402
-from research_pipeline.storage.sqlite_store import SqliteStore  # noqa: E402
+from research_pipeline.protocols import ReadStore  # noqa: E402
+from research_pipeline.storage.views import ItemDetail  # noqa: E402
 
 RULE = "-" * 72
 
@@ -38,7 +44,7 @@ def _fmt_date(value: str | None, width: int = 16) -> str:
     return (value or "").replace("T", " ")[:width].ljust(width)
 
 
-def cmd_stats(reader: ResearchStoreReader, args) -> int:
+def cmd_stats(reader: ReadStore, args) -> int:
     s = reader.stats()
     print(f"items        : {s.items}")
     print(f"sources      : {s.sources}")
@@ -53,7 +59,7 @@ def cmd_stats(reader: ResearchStoreReader, args) -> int:
     return 0
 
 
-def cmd_list(reader: ResearchStoreReader, args) -> int:
+def cmd_list(reader: ReadStore, args) -> int:
     items = reader.list_items(limit=args.limit, unreviewed_only=args.unreviewed)
     if not items:
         print("nothing to show" + (" -- every item has a note" if args.unreviewed else ""))
@@ -103,7 +109,7 @@ def _print_item(item: ItemDetail) -> None:
               f"{item.id} \"...\"")
 
 
-def cmd_view(reader: ResearchStoreReader, args) -> int:
+def cmd_view(reader: ReadStore, args) -> int:
     item = reader.get_item(args.id)
     if item is None:
         print(f"no item with id {args.id}", file=sys.stderr)
@@ -112,7 +118,7 @@ def cmd_view(reader: ResearchStoreReader, args) -> int:
     return 0
 
 
-def cmd_search(reader: ResearchStoreReader, args) -> int:
+def cmd_search(reader: ReadStore, args) -> int:
     hits = reader.search(" ".join(args.query), limit=args.limit)
     if not hits:
         print("no matches")
@@ -124,8 +130,8 @@ def cmd_search(reader: ResearchStoreReader, args) -> int:
     return 0
 
 
-def cmd_export(store_path: Path, args) -> int:
-    with ResearchStoreReader(store_path) as reader:
+def cmd_export(storage: StorageConfig, args) -> int:
+    with open_read_store(storage) as reader:
         rows = reader.export_rows()
     if not rows:
         print("store is empty -- nothing to export")
@@ -144,15 +150,15 @@ def cmd_export(store_path: Path, args) -> int:
     return 0
 
 
-def cmd_note(store_path: Path, args) -> int:
-    with SqliteStore(store_path) as store:
+def cmd_note(storage: StorageConfig, args) -> int:
+    with open_annotation_store(storage) as store:
         store.add_note(args.id, args.body)
     print(f"note added to item {args.id}")
     return 0
 
 
-def cmd_field(store_path: Path, args) -> int:
-    with SqliteStore(store_path) as store:
+def cmd_field(storage: StorageConfig, args) -> int:
+    with open_annotation_store(storage) as store:
         store.add_field(args.id, args.name, args.value)
     print(f"{args.name} = {args.value} added to item {args.id} (origin: human)")
     return 0
@@ -200,27 +206,31 @@ def main() -> int:
     root = Path(__file__).resolve().parent.parent
     load_project_env(root)
 
-    store_path = Path(args.db or os.environ.get("STORE_DB_PATH", "./data/research.db"))
-    if not store_path.is_absolute():
-        store_path = root / store_path
-
     try:
-        if args.command == "note":
-            return cmd_note(store_path, args)
-        if args.command == "field":
-            return cmd_field(store_path, args)
-        if args.command == "export":
-            return cmd_export(store_path, args)
+        storage = StorageConfig.from_env(root, args.db)
 
-        with ResearchStoreReader(store_path) as reader:
+        if args.command == "note":
+            return cmd_note(storage, args)
+        if args.command == "field":
+            return cmd_field(storage, args)
+        if args.command == "export":
+            return cmd_export(storage, args)
+
+        with open_read_store(storage) as reader:
             return {
                 "stats": cmd_stats,
                 "list": cmd_list,
                 "view": cmd_view,
                 "search": cmd_search,
             }[args.command](reader, args)
-    except (FileNotFoundError, KeyError, ValueError) as e:
+    except KeyError as e:
+        # KeyError stringifies as "'no such item'" -- strip the quotes it adds,
+        # and only for KeyError, or a message that legitimately ends in a quote
+        # ("got 'nope'") gets silently truncated.
         print(str(e).strip("'"), file=sys.stderr)
+        return 1
+    except (ConfigError, FileNotFoundError, ValueError) as e:
+        print(e, file=sys.stderr)
         return 1
 
 

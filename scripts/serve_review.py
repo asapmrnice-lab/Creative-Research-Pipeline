@@ -28,18 +28,22 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from research_pipeline.config import (  # noqa: E402
+    ConfigError,
+    StorageConfig,
+    open_annotation_store,
+    open_read_store,
+)
 from research_pipeline.env import load_project_env  # noqa: E402
 from research_pipeline.filtering import KeywordFilter, KeywordFilterConfig  # noqa: E402
 from research_pipeline.review import render_page  # noqa: E402
-from research_pipeline.storage.reader import ResearchStoreReader  # noqa: E402
-from research_pipeline.storage.sqlite_store import SqliteStore  # noqa: E402
 
 # A single note is a sentence or two; anything vastly larger is a mistake or an
 # abuse, and reading it into memory unbounded would be the bug.
 MAX_NOTE_BYTES = 64 * 1024
 
 
-def build_handler(store_path: Path, kf: KeywordFilter | None):
+def build_handler(storage: StorageConfig, kf: KeywordFilter | None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "ResearchStore/1.0"
 
@@ -75,7 +79,7 @@ def build_handler(store_path: Path, kf: KeywordFilter | None):
             query = (params.get("q", [""])[0]).strip()
             unreviewed = bool(params.get("unreviewed", [""])[0])
 
-            with ResearchStoreReader(store_path) as reader:
+            with open_read_store(storage) as reader:
                 stats = reader.stats()
                 if query:
                     # Search decides the order (by relevance); the un-reviewed
@@ -95,7 +99,7 @@ def build_handler(store_path: Path, kf: KeywordFilter | None):
                     kf=kf,
                     query=query,
                     unreviewed=unreviewed,
-                    db_label=store_path.name,
+                    db_label=storage.label,
                 )
             )
 
@@ -119,7 +123,7 @@ def build_handler(store_path: Path, kf: KeywordFilter | None):
             try:
                 item_id = int(form.get("id", ["0"])[0])
                 body = form.get("body", [""])[0]
-                with SqliteStore(store_path) as store:
+                with open_annotation_store(storage) as store:
                     store.add_note(item_id, body)
             except (ValueError, KeyError) as e:
                 self._send(f"<h1>400</h1><p>{e}</p>", 400)
@@ -144,14 +148,13 @@ def main() -> int:
     parser.add_argument("--no-open", action="store_true", help="do not open a browser")
     args = parser.parse_args()
 
-    store_path = Path(args.db or os.environ.get("STORE_DB_PATH", "./data/research.db"))
-    if not store_path.is_absolute():
-        store_path = root / store_path
-
     try:
-        with ResearchStoreReader(store_path) as reader:
+        storage = StorageConfig.from_env(root, args.db)
+        # Fail before binding a port: a server that starts and then 500s on
+        # every request is worse than one that refuses to start.
+        with open_read_store(storage) as reader:
             stats = reader.stats()
-    except FileNotFoundError as e:
+    except (ConfigError, FileNotFoundError) as e:
         print(e, file=sys.stderr)
         return 1
 
@@ -160,9 +163,9 @@ def main() -> int:
     except ValueError:
         kf = None  # highlighting is optional; the page works without it
 
-    httpd = ThreadingHTTPServer((args.host, args.port), build_handler(store_path, kf))
+    httpd = ThreadingHTTPServer((args.host, args.port), build_handler(storage, kf))
     url = f"http://{args.host}:{args.port}/"
-    print(f"store : {store_path}")
+    print(f"store : {storage.label}")
     print(f"items : {stats.items} ({stats.unreviewed} un-reviewed)")
     print(f"serving {url}   (Ctrl-C to stop)")
     if args.host not in ("127.0.0.1", "localhost", "::1"):

@@ -3,7 +3,14 @@ name = "research-pipeline"
 version = "0.1.0"
 description = "Personal creative research pipeline -- mechanical collect, store, structure, retrieve."
 requires-python = ">=3.12"
+# Deliberately empty: the default SQLite backend, the keyword filter, the CLI
+# and the local review page are all standard library. A dependency here would
+# be a dependency for everyone, including the test suite.
 dependencies = []
+
+[project.optional-dependencies]
+# Only needed with STORE_BACKEND=supabase.  pip install -e ".[supabase]"
+supabase = ["psycopg[binary]>=3.1"]
 
 [build-system]
 requires = ["setuptools>=68"]

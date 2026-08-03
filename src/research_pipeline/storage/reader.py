@@ -11,101 +11,35 @@ has to know the column order or the schema.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass, field
 from pathlib import Path
+
+from .views import (
+    Field,
+    ItemDetail,
+    ItemSummary,
+    Media,
+    Note,
+    SearchHit,
+    StoreStats,
+)
+from .views import preview as _preview
+
+# Re-exported: callers have always imported these from here, and the view
+# types are part of what a reader returns regardless of where they are defined.
+__all__ = [
+    "Field",
+    "ItemDetail",
+    "ItemSummary",
+    "Media",
+    "Note",
+    "ResearchStoreReader",
+    "SearchHit",
+    "StoreStats",
+]
 
 # FTS5 treats these as operators, so a query containing one is passed through
 # untouched instead of being turned into a prefix search.
 _FTS_OPERATORS = ('"', "*", ":", "(", ")", " OR ", " AND ", " NOT ", "NEAR")
-
-
-@dataclass(frozen=True)
-class ItemSummary:
-    """One row of a list view."""
-
-    id: int
-    posted_at: str | None
-    channel: str
-    keywords: tuple[str, ...]
-    note_count: int
-    preview: str
-    url: str | None = None
-
-    @property
-    def reviewed(self) -> bool:
-        """Workflow 2 defines un-reviewed as "has no Notes yet"."""
-        return self.note_count > 0
-
-
-@dataclass(frozen=True)
-class Note:
-    body: str
-    author: str
-    created_at: str
-
-
-@dataclass(frozen=True)
-class Field:
-    name: str
-    value: str
-    origin: str
-
-
-@dataclass(frozen=True)
-class Media:
-    kind: str
-    file_name: str | None
-    storage_path: str | None
-
-
-@dataclass(frozen=True)
-class ItemDetail:
-    """Everything held about one item, assembled for a single view."""
-
-    id: int
-    external_id: str
-    posted_at: str | None
-    ingested_at: str
-    channel: str
-    handle: str | None
-    url: str | None
-    text: str
-    fields: tuple[Field, ...] = ()
-    notes: tuple[Note, ...] = ()
-    media: tuple[Media, ...] = ()
-
-    @property
-    def keywords(self) -> tuple[str, ...]:
-        return tuple(f.value for f in self.fields if f.name == "keyword")
-
-
-@dataclass(frozen=True)
-class SearchHit:
-    id: int
-    posted_at: str | None
-    channel: str
-    snippet: str
-
-
-@dataclass
-class StoreStats:
-    items: int = 0
-    sources: int = 0
-    notes: int = 0
-    media: int = 0
-    unreviewed: int = 0
-    keywords: dict[str, int] = field(default_factory=dict)
-    first_post: str | None = None
-    last_post: str | None = None
-
-
-def _preview(text: str, width: int) -> str:
-    """First meaningful line, collapsed to one line and clipped."""
-    for line in text.splitlines():
-        stripped = line.strip().strip("*").strip()
-        if stripped:
-            return stripped[:width] + ("…" if len(stripped) > width else "")
-    return ""
 
 
 class ResearchStoreReader:

@@ -18,6 +18,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from research_pipeline.adapters.archive import ArchiveSource  # noqa: E402
+from research_pipeline.config import (  # noqa: E402
+    ConfigError,
+    StorageConfig,
+    open_collection_store,
+)
 from research_pipeline.domain import RawPost  # noqa: E402
 from research_pipeline.env import load_project_env  # noqa: E402
 from research_pipeline.filtering import (  # noqa: E402
@@ -26,7 +31,6 @@ from research_pipeline.filtering import (  # noqa: E402
     KeywordGate,
 )
 from research_pipeline.pipeline import ingest  # noqa: E402
-from research_pipeline.storage.sqlite_store import SqliteStore  # noqa: E402
 
 
 class DryRunStore:
@@ -44,6 +48,18 @@ class DryRunStore:
             return False
         self.seen.add(post.external_id)
         return True
+
+    def count_items(self) -> int:
+        return len(self.seen)
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self) -> "DryRunStore":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        pass
 
 
 def main() -> int:
@@ -66,28 +82,33 @@ def main() -> int:
     gate = KeywordGate(KeywordFilter(KeywordFilterConfig.from_env()))
     source = ArchiveSource(root / archive)
 
-    store_path = args.db or os.environ.get("STORE_DB_PATH", "./data/research.db")
-    store = DryRunStore() if args.dry_run else SqliteStore(root / store_path)
+    try:
+        storage = StorageConfig.from_env(root, args.db)
+    except ConfigError as e:
+        print(e, file=sys.stderr)
+        return 1
+
+    store = DryRunStore() if args.dry_run else open_collection_store(storage)
 
     print(f"keywords : {', '.join(gate.keywords)}")
     print(f"source   : {archive}")
-    print(f"target   : {'(dry run -- nothing written)' if args.dry_run else store_path}")
+    print(f"target   : {'(dry run -- nothing written)' if args.dry_run else storage.label}")
     print()
 
-    result = ingest(source, gate, store)
+    with store:
+        result = ingest(source, gate, store)
 
-    print(f"posts seen      : {result.seen}")
-    print(f"  collected     : {result.collected}")
-    print(f"    newly stored: {result.stored}")
-    print(f"    already had : {result.duplicates}")
-    print("  rejected      :")
-    for reason, count in sorted(result.rejected.items()):
-        print(f"    {reason:<12}: {count}")
+        print(f"posts seen      : {result.seen}")
+        print(f"  collected     : {result.collected}")
+        print(f"    newly stored: {result.stored}")
+        print(f"    already had : {result.duplicates}")
+        print("  rejected      :")
+        for reason, count in sorted(result.rejected.items()):
+            print(f"    {reason:<12}: {count}")
 
-    if isinstance(store, SqliteStore):
-        print()
-        print(f"items in store  : {store.count_items()}")
-        store.close()
+        if not args.dry_run:
+            print()
+            print(f"items in store  : {store.count_items()}")
     return 0
 
 

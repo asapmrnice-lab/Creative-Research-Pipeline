@@ -44,14 +44,34 @@ If any of the "Allowed" column still feels like too much AI for the PM's taste, 
 
 ---
 
+## 3b. The Collection Gate (added after the fact — this plan originally missed it)
+
+Everything above assumes the pipeline collects *every* post from a tracked Source and then decides what to do with it. That is not what we want, and the omission was an oversight in the first draft of this plan. A tracked channel posts a great deal that has nothing to do with creatives; storing all of it and filtering at read time means downloading every video to keep a fraction of them.
+
+So there is a **gate in front of storage**: a post is collected only when its text carries one of the human's configured keywords. A post that matches nothing is never written, and its media is therefore never fetched.
+
+**Why this is not the "judgment" the Core Principle forbids.** The table in §3 forbids *"deciding a post is low quality and dropping it."* The gate does drop posts, so the distinction has to be exact:
+
+- The **human** writes the keyword list. The machine never adds, infers, widens or "improves" a keyword.
+- The rule is **literal and deterministic** — string matching plus declared morphology, no model, no scoring, no threshold. The same post and the same list always produce the same verdict, and a human can verify it by reading.
+- It is a **scope decision, not a quality decision**. The gate says "this is not the subject I am researching," never "this is a bad post."
+
+That is the same category as choosing which channels to track in the first place — which the architecture already treats as the human's call. The gate is that choice expressed one level finer.
+
+**The cost, stated plainly:** filtering at collection time is lossy and not retroactive. Adding a keyword later does **not** backfill posts already rejected — they were never stored, so there is nothing to re-scan. This is the deliberate trade for not hoarding gigabytes of irrelevant video. It is why the gate reports its rejections by reason (`no-text` vs `no-keyword`) rather than silently discarding, so the human can see what a list is costing them and widen it before it matters.
+
+**Where it sits relative to "never deletes":** the architecture's guarantee that items are never deleted applies to *collected* items. A post the gate rejected was never a Research Item, so nothing was deleted. No tombstone is written.
+
+---
+
 ## 4. SOLID mapping (the "solid principles" ask)
 
 The doc's modules already lean this way; here's the explicit mapping and where I'd tighten:
 
-- **S — Single Responsibility.** Each module owns one job: `SourceRegistry`, `IngestionAdapter`, `NoiseCleaner`, `Deduplicator`, `ExtractionEngine`, `StorageLayer`, `SearchModule`, `CLI`. Cleaning and dedup are *split out* of the Extraction Engine (the doc lumped them loosely) so each is independently testable and disableable.
-- **O — Open/Closed.** New source = new `IngestionAdapter` implementation. New fact type = new entry in the extraction **whitelist config**, not code. New cleaning rule = new `CleaningStep`. No edits to the core.
+- **S — Single Responsibility.** Each module owns one job: `SourceRegistry`, `IngestionAdapter`, `CollectionGate`, `NoiseCleaner`, `Deduplicator`, `ExtractionEngine`, `StorageLayer`, `SearchModule`, `CLI`. Cleaning and dedup are *split out* of the Extraction Engine (the doc lumped them loosely) so each is independently testable and disableable. The gate (§3b) is likewise its own module, not a branch inside the adapter — an adapter that knew about keywords could not be reused unfiltered.
+- **O — Open/Closed.** New source = new `IngestionAdapter` implementation. New fact type = new entry in the extraction **whitelist config**, not code. New cleaning rule = new `CleaningStep`. New collection rule = new `Gate` implementation. No edits to the core.
 - **L — Liskov.** Every adapter satisfies the same `Adapter` protocol (`fetch_new() -> Iterable[RawPost]`); the pipeline treats Telegram exactly like a future YouTube adapter.
-- **I — Interface Segregation.** Small protocols: `Adapter`, `Cleaner`, `Deduplicator`, `Extractor`, `Store`, `LLMClient`. The Search module depends only on a read-only `Store` view; it can't write.
+- **I — Interface Segregation.** Small protocols: `Adapter`, `Gate`, `Cleaner`, `Deduplicator`, `Extractor`, `Store`, `LLMClient`. The Search module depends only on a read-only `Store` view; it can't write.
 - **D — Dependency Inversion.** The pipeline depends on **abstractions** (`LLMClient`, `Store`), with concrete `AnthropicClient` (Haiku) and `SupabaseStore` injected at the composition root. Swapping Haiku↔Sonnet, or Supabase↔SQLite, touches one wiring file.
 
 ---
@@ -122,6 +142,9 @@ telegram_agent/
     protocols.py       # Adapter, Cleaner, Deduplicator, Extractor, Store, LLMClient
     adapters/
       telegram.py      # Telethon/Bot API → RawPost
+    filtering/
+      keywords.py      # the literal matcher: normalisation + morphology
+      gate.py          # Gate impl: RawPost → Decision(verdict, keywords)
     cleaning/
       steps.py         # deterministic CleaningSteps
       llm_cleaner.py   # Haiku structured-output cleaner
@@ -137,7 +160,7 @@ telegram_agent/
     llm/
       anthropic_client.py  # Haiku default, Batch + caching, injectable
     cli/                 # list / view / add-note / add-field / search / export-csv
-    pipeline.py          # Registry → Adapter → Clean → Dedup → Extract → Store
+    pipeline.py          # Registry → Adapter → Gate → Clean → Dedup → Extract → Store
     config.py            # composition root: wires concretes into protocols
   skills/skill-creator/  # cloned Anthropic reference (agent-skill authoring)
 ```
@@ -153,16 +176,43 @@ telegram_agent/
 1. Domain models + protocols + Supabase schema/migrations.
 2. `SupabaseStore` (writer) + read-only `search.py`.
 3. Telegram adapter → raw ingest (no cleaning/extraction yet) → prove end-to-end store.
-4. Deterministic cleaning + exact/simhash dedup (still no model).
-5. Haiku extraction (structured output, whitelist, Batch API + caching).
-6. Haiku noise-cleaning model step.
-7. CLI: list / view / add-note / add-field / full-text search / CSV export.
-8. (Deferred, Stage 9) pgvector semantic search + semantic dedup tier.
+4. **Collection gate (§3b)** in front of the store, with rejection counters that reconcile against posts seen.
+5. Deterministic cleaning + exact/simhash dedup (still no model).
+6. Haiku extraction (structured output, whitelist, Batch API + caching).
+7. Haiku noise-cleaning model step.
+8. CLI: list / view / add-note / add-field / full-text search / CSV export.
+9. (Deferred, Stage 9) pgvector semantic search + semantic dedup tier.
+
+**Build order as actually executed (recorded 2026-08-03).** The gate was built before storage, not after, because the trial archive had already downloaded everything unfiltered and the gate was the fix for that. Steps 3, 4 and 8 are done against a **local SQLite** store; steps 1–2 (Supabase) are the outstanding work, not the finished foundation this list assumes. See §12.
+
+---
+
+## 12. What the Supabase move actually costs (audit, 2026-08-03)
+
+§4 claims swapping storage "touches one wiring file." That is the *design intent* and it is nearly true on the write side, but it is not true of the code as it stands. Before `SupabaseStore` is written, four things are in the way:
+
+1. **There is no composition root.** `config.py` from §9 was never built. `scripts/ingest.py`, `scripts/review.py` and `scripts/serve_review.py` each import and construct `SqliteStore` / `ResearchStoreReader` **directly**. Every one of those is an edit site. The `Store` protocol exists but nothing depends on it — `ingest.py` even does `isinstance(store, SqliteStore)` to decide whether to print a count.
+2. **The read side has no protocol.** `protocols.py` defines `Source`, `Gate` and `Store` — write-side only. `ResearchStoreReader` is a concrete class with no abstraction above it, so the CLI and the review page are welded to SQLite. This is the larger half of the work, and §4's "the Search module depends only on a read-only `Store` view" is currently aspiration, not fact.
+3. **Search is SQLite-specific in its implementation, not just its dialect.** `reader.search()` uses an FTS5 virtual table, `MATCH`, and the `snippet()` function, kept in sync by a SQL trigger. Postgres does the same job with `tsvector`, a GIN index and `ts_headline`. The *behaviour* to preserve is the deliberate one: a bare word becomes a prefix query so Russian inflections are found. That intent has to be re-implemented, not translated.
+4. **Media has no implementation on either side.** The store records `storage_path` and nothing ever writes a file. Moving to a Supabase Storage bucket is therefore not a migration — it is the original build, still outstanding.
+
+**What is genuinely cheap:** the domain layer. `RawPost`/`RawSource`/`RawMedia` know nothing about storage, `content_hash()` is pure, the gate never touches a database, and `pipeline.ingest()` depends only on protocols. None of that changes. The schema in `sqlite_store.py` already maps 1:1 to §6's Postgres tables, including the `origin` CHECK and the `author='human'` constraint — those become Postgres `ENUM`/`CHECK` almost verbatim.
+
+**Order of work, so nothing is done twice:**
+
+1. Commit the review layer as it stands (currently uncommitted — refactoring on top of uncommitted work loses the ability to bisect).
+2. Extract a read-side protocol (`ReadStore`) from `ResearchStoreReader`'s existing public surface — `list_items`, `get_item`, `search`, `stats`, `export_rows`. Pure refactor, no behaviour change, 186 tests must stay green.
+3. Add `config.py` as the composition root; make the three scripts request a store from it rather than construct one. Delete the `isinstance` check.
+4. Only then write `SupabaseStore` + `SupabaseReadStore` against those protocols, and the Postgres migration.
+5. Backfill: re-run ingest against the archive to populate Supabase. Nothing needs migrating out of SQLite — the archive is the source of truth for collected posts and re-ingest is idempotent on `(source, external_id)`.
+
+Steps 2–3 are worth doing regardless of which backend wins, which is why they come first.
 
 ---
 
 ## Open questions for you
 
-1. **AI scope (§3):** comfortable with Claude doing mechanical cleaning + whitelist extraction + dedup *signals*, or do you want the model kept out of extraction entirely (regex-only) for a first cut?
-2. **Telegram access:** Bot API (bots must be in the channel) or a user client (Telethon/MTProto, needs your account + API credentials)? This changes the adapter.
+1. ~~**AI scope (§3):**~~ — deferred until storage is settled; no model is called anywhere yet.
+2. **Telegram access:** Bot API (bots must be in the channel) or a user client (Telethon/MTProto, needs your account + API credentials)? This changes the adapter. Still open — collection currently reads the trial archive, not Telegram.
 3. **Confidence handling:** auto-escalate low-confidence Haiku extractions to Sonnet, or just flag them for human review?
+4. **SQLite's fate after Supabase** — see §12. Kept as the offline/test implementation behind the protocol, or removed once Supabase works?
