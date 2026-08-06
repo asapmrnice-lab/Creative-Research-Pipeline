@@ -41,6 +41,7 @@ from research_pipeline.dedup import (
     simhash_hex,
 )
 from research_pipeline.detect import detect
+from research_pipeline.detect.signals import DETECT_VERSION
 from research_pipeline.domain import RawPost, RawSource
 from research_pipeline.extraction import ExtractionEngine
 from research_pipeline.extraction import whitelist as wl
@@ -155,6 +156,52 @@ def test_the_gate_records_its_own_provenance(store):
     ).fetchone()
     assert row[0] == "system"
     assert row[1] and row[2]
+
+
+def test_rows_written_before_the_rule_are_counted_rather_than_ignored(store):
+    """The trigger guards inserts, so rows that predate it are outside it.
+
+    Those rows are the one case where the missing provenance is knowable
+    instead of lost -- only the gate ever wrote a keyword field -- so they are
+    counted, and attributing them is a command the human runs, never a
+    migration that rewrites collected data unasked.
+    """
+    item = make_item(store)
+    # The legacy state, reproduced: a system row with no model. It has to be
+    # made by UPDATE, because the trigger would refuse to insert it today.
+    store._conn.execute(
+        "UPDATE structured_field SET model = NULL, prompt_version = NULL "
+        "WHERE research_item_id = ? AND name = 'keyword'",
+        (item,),
+    )
+    assert store.untraceable_system_fields() == 1
+
+    assert store.backfill_keyword_provenance() == 1
+    assert store.untraceable_system_fields() == 0
+    row = store._conn.execute(
+        "SELECT model, prompt_version FROM structured_field WHERE name = 'keyword'"
+    ).fetchone()
+    assert row == ("keyword-gate", "keyword-1")
+
+
+def test_the_backfill_leaves_a_field_it_cannot_attribute_alone(store):
+    """It knows who wrote a keyword field. It does not know who wrote anything else.
+
+    Guessing here would put a name on a row nobody can check, which is worse
+    than the blank it replaced.
+    """
+    item = make_item(store)
+    store.add_machine_field(item, "geo", "Бразилия", Provenance("haiku", "extract-1"))
+    store._conn.execute("UPDATE structured_field SET model = NULL, prompt_version = NULL")
+
+    assert store.backfill_keyword_provenance() == 1  # the keyword row only
+    assert store.untraceable_system_fields() == 1
+    assert (
+        store._conn.execute(
+            "SELECT model FROM structured_field WHERE name = 'geo'"
+        ).fetchone()[0]
+        is None
+    )
 
 
 # ===========================================================================
@@ -415,6 +462,33 @@ def test_extraction_merges_a_split_post_without_losing_facts():
     assert outcome.confidence == 0.4
 
 
+def test_each_chunk_of_a_post_is_asked_about_separately_and_uniquely():
+    """The key is (item, chunk, version), and it is what makes a re-run safe.
+
+    Two chunks sharing a key would be one batch request, and the API would
+    silently drop the other -- so the second half of a long post would vanish
+    without an error anywhere.
+    """
+    client = RecordingLLM()
+    text = "\n\n".join("параграф " + "слово " * 200 for _ in range(4))
+    ExtractionEngine(client, chunk_chars=1000).extract([(7, text)])
+
+    keys = [t.key for t in client.seen]
+    assert len(keys) > 1
+    assert len(set(keys)) == len(keys)
+    assert all(key.startswith("x7-c") for key in keys)
+
+
+def test_every_chunk_carries_the_identical_instructions():
+    """The cacheable prefix must be byte-identical or nothing caches at all."""
+    client = RecordingLLM()
+    text = "\n\n".join("параграф " + "слово " * 200 for _ in range(4))
+    ExtractionEngine(client, chunk_chars=1000).extract([(7, text)])
+
+    assert len({t.instructions for t in client.seen}) == 1
+    assert len({id(t.schema) for t in client.seen}) == 1
+
+
 def test_extraction_writes_fields_with_provenance(store):
     item = make_item(store)
     engine = ExtractionEngine(
@@ -487,6 +561,20 @@ def test_a_cleaner_names_only_the_passes_that_will_actually_run():
     assert CLEAN_LLM_VERSION in LlmCleaner(RecordingLLM()).version
 
 
+def test_a_sample_can_be_processed_before_the_whole_store(store):
+    """`--limit` on a paid stage: try fifty posts before paying for three thousand."""
+    first = make_item(store)
+    post = RawPost(
+        source=RawSource(platform="telegram", platform_id="chat", title="Test"),
+        external_id="chat:2",
+        text="ещё кейс",
+    )
+    store.save(post, ("кейс",))
+
+    assert len(store.items_needing("clean-det-1")) == 2
+    assert [i for i, _ in store.items_needing("clean-det-1", limit=1)] == [first]
+
+
 def test_a_second_run_has_nothing_left_to_do(store):
     """The idempotency key from plan §5, end to end."""
     item = make_item(store, "кейс​  по   Бразилии")
@@ -541,6 +629,31 @@ def test_cleaning_with_no_model_still_cleans(store):
     assert cleaned == "кейс по Бразилии"
     # Attributed to the code that did the work, not to a model that did not.
     assert model == "deterministic-cleaner"
+
+
+def test_the_model_is_shown_the_cleaned_text_and_never_the_raw_post():
+    """What is sent is what the deterministic pass produced.
+
+    Not a cost optimisation: the raw post carries the invisible characters the
+    first pass exists to remove, and a model given those returns removed-spans
+    that no longer match anything in the text they came from -- so the audit
+    trail would be unverifiable exactly where it matters.
+    """
+    raw = "кейс​  по   Бразилии"
+    client = RecordingLLM()
+    LlmCleaner(client).clean([(1, raw)])
+
+    assert [t.payload for t in client.seen] == ["кейс по Бразилии"]
+    assert "​" not in client.seen[0].payload
+
+
+def test_an_empty_post_is_never_sent_to_the_model():
+    """Nothing to redact, and a paid call to prove it would still cost money."""
+    client = RecordingLLM()
+    outcomes = LlmCleaner(client).clean([(1, "   "), (2, None)])
+
+    assert client.seen == []
+    assert [o.text for o in outcomes] == ["", ""]
 
 
 # ===========================================================================
@@ -836,6 +949,36 @@ def test_the_index_only_reports_and_never_deletes(store):
     assert not hasattr(index, "delete") and not hasattr(index, "merge")
 
 
+def test_scanning_a_whole_store_reports_the_pairs_and_changes_nothing():
+    """How the stage is actually run: fingerprint everything, report, stop."""
+    original, other = LONG_POSTS[0], LONG_POSTS[1]
+    flags = NearDuplicateIndex().scan(
+        [(1, original), (2, other), (3, original + "\n\n🔥 Подписывайся")]
+    )
+    assert [(f.item_id, f.duplicate_of) for f in flags] == [(3, 1)]
+
+
+def test_a_post_is_never_flagged_against_itself():
+    """Each item is compared only with items seen before it.
+
+    The later of the pair is the candidate, which is also the one the human
+    wants to look at: the earlier post is the one already filed.
+    """
+    flags = NearDuplicateIndex().scan([(1, LONG_POSTS[0]), (2, LONG_POSTS[0])])
+    assert [(f.item_id, f.duplicate_of) for f in flags] == [(2, 1)]
+
+
+def test_the_closest_earlier_match_is_the_one_reported():
+    """A near-identical repost must win over a merely similar one."""
+    text = LONG_POSTS[0]
+    index = NearDuplicateIndex()
+    index.add(1, text.replace("\n\n", "\n") + "\n\n🔥 Подписывайся на канал сейчас")
+    index.add(2, text)
+    flag = index.add(3, text)
+
+    assert flag is not None and flag.duplicate_of == 2 and flag.distance == 0
+
+
 def test_dedup_distance_comes_from_the_environment():
     assert DedupConfig.from_env({"DEDUP_SIMHASH_DISTANCE": "7"}).distance == 7
     assert DedupConfig.from_env({}).distance == DedupConfig().distance
@@ -919,6 +1062,21 @@ def test_only_true_flags_become_fields():
     names = dict(detect("Кейс по Бразилии без ссылок и таблиц").as_fields())
     assert names["language"] == "ru"
     assert "has_table" not in names and "has_link" not in names
+
+
+def test_a_count_is_stored_as_a_count_not_as_a_flag():
+    """A count is an observation about the post; a zero is an observation about
+    the schema, so it is left out for the same reason `has_table = false` is."""
+    loud = dict(detect("🔥🔥🔥 кейс по Бразилии 🚀").as_fields())
+    quiet = dict(detect("кейс по Бразилии, без картинок").as_fields())
+
+    assert loud["emoji_count"] == "4"
+    assert "emoji_count" not in quiet
+
+
+def test_a_label_carries_the_rule_version_that_produced_it():
+    """Detection has no model, but it still has a version -- the rules change."""
+    assert detect("Кейс по Бразилии").version == DETECT_VERSION
 
 
 def test_detection_offers_no_judgment_fields():
