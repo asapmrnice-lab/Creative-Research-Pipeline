@@ -12,12 +12,22 @@ dependencies = []
 # Only needed with STORE_BACKEND=supabase.  pip install -e ".[supabase]"
 supabase = ["psycopg[binary]>=3.1"]
 
+# Only needed when ANTHROPIC_API_KEY is set.  pip install -e ".[llm]"
+# The deterministic cleaning, dedup and detection stages need none of this --
+# they are the fallback the plan keeps available, and they are what the test
+# suite exercises.
+llm = ["anthropic>=0.116"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The extraction whitelist is data the package reads at runtime, not source.
+[tool.setuptools.package-data]
+"research_pipeline.extraction" = ["whitelist.json"]
 
 [tool.pytest.ini_options]
 # src/ layout: put the package on sys.path without needing an install step.

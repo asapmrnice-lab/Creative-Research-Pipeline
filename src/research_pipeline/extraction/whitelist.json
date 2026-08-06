@@ -1,0 +1,53 @@
+{
+  "version": "extract-1",
+  "_comment": [
+    "The Stage-3 field whitelist. This file is the single source of both the",
+    "JSON Schema sent to the model and the instructions that accompany it, so",
+    "a new fact type is an entry here and no change to any Python file.",
+    "",
+    "JSON rather than the YAML plan §9 sketched: the project declares no",
+    "runtime dependencies, and adding PyYAML to read six field descriptions",
+    "would make every install and every test pay for it.",
+    "",
+    "Rules for adding a field. It must be something a human could point to in",
+    "the post with a finger. If answering it requires knowing the industry,",
+    "estimating, or reading between the lines, it is a judgment and belongs in",
+    "a human Note instead.",
+    "",
+    "Bump `version` on any change. It is the prompt_version stored against",
+    "every extracted value, and it is what makes a re-run replace its own",
+    "earlier output instead of duplicating it."
+  ],
+  "fields": [
+    {
+      "name": "geo",
+      "type": "string_list",
+      "description": "Country, region or city names the post explicitly targets or reports on, exactly as written (e.g. 'RU', 'Тир 1', 'Бразилия'). Do not infer a geo from language, currency or brand."
+    },
+    {
+      "name": "brand",
+      "type": "string_list",
+      "description": "Named brands, products, apps or advertisers mentioned by name. Copy the name as written. Do not include the channel's own name."
+    },
+    {
+      "name": "offer",
+      "type": "string",
+      "description": "The offer or vertical, only when the post names it in so many words (e.g. 'гемблинг', 'нутра', 'дейтинг'). Null unless it is stated."
+    },
+    {
+      "name": "kpis",
+      "type": "string_list",
+      "description": "Performance metrics stated with their values, copied whole (e.g. 'CR 12%', 'ROI 140%', 'CPI $0.8'). Include the metric name and the number together. Do not compute or convert anything."
+    },
+    {
+      "name": "dates",
+      "type": "string_list",
+      "description": "Dates and date ranges written in the post, exactly as written (e.g. '15 марта', 'Q2 2026'). Do not resolve relative expressions like 'вчера' into a calendar date."
+    },
+    {
+      "name": "amounts",
+      "type": "string_list",
+      "description": "Money amounts and budgets with their currency, exactly as written (e.g. '$5000', '300к руб'). Do not convert currencies or sum anything."
+    }
+  ]
+}

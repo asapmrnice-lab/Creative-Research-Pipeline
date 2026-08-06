@@ -42,6 +42,29 @@ Two guardrails make this safe and auditable:
 
 If any of the "Allowed" column still feels like too much AI for the PM's taste, the fallback is regex/heuristic noise-cleaning + exact-hash dedup with **no** model at all — the architecture below keeps the LLM behind an interface so it can be disabled per-stage.
 
+### 3a. As actually executed (recorded 2026-08-05)
+
+Built and running; `scripts/enrich.py` is the entry point. **The default configuration calls no model** — with `ANTHROPIC_API_KEY` empty, three of the four Allowed rows run anyway, and the fourth reports itself skipped. That is the fallback above, shipped as the default rather than as an escape hatch.
+
+| §3 row | How it was built | Needs a model? |
+|---|---|---|
+| Noise cleaning | `cleaning/steps.py` (5 deterministic steps) then `cleaning/llm_cleaner.py` | Only the second pass |
+| Whitelist extraction | `extraction/whitelist.json` compiled to a JSON Schema, `extraction/engine.py` | Yes |
+| Dedup signal | `dedup/hashing.py` — SimHash, flag-only | No |
+| Language/format detection | `detect/signals.py` — character counting | No — see below |
+
+Four things came out differently from the plan as written:
+
+1. **Detection never needed a model.** Which script a post is in, and whether it holds a link or a table, are countable properties of the characters. The row's real value turned out to be the line beside it in the Forbidden column: a label says what a post *is*, so the human can find it; a summary says what it *means*, so the human can skip it. `Signals` has no `topic`, `quality` or `category` field, and a test asserts it never grows one.
+
+2. **"Do not rephrase" was made checkable rather than instructed.** Model-cleaned text is accepted only if its whitespace-delimited tokens are a subsequence of the input's — every surviving word present, unaltered, in order. Output that fails is discarded whole in favour of the deterministic text. The check must be token-level, not character-level: character-wise, turning `ROI 140%` into `ROI 14%` *is* a deletion, and it is precisely the failure worth catching.
+
+3. **Both guardrails moved into the schema.** `raw_text` is protected by a trigger (SQLite and Postgres both), and a system-origin field without `model` and `prompt_version` is rejected by the database — the same mechanism as the `note.author = 'human'` CHECK, so no future caller can forget. The gate's own keyword fields were retro-fitted with provenance to satisfy it; `--backfill-provenance` attributes pre-existing rows.
+
+4. **Prompt caching does not fire on Haiku, and §5 should not assume it does.** The minimum cacheable prefix on `claude-haiku-4-5` is 4096 tokens; the whitelist instructions are far shorter, so caching silently no-ops (`cache_creation_input_tokens: 0`, no error). Padding the prompt to reach the minimum would mean paying for tokens in order to pretend to save tokens. The client therefore *reports* cache tokens on every result rather than assuming the saving, and the Batch API's 50% discount is the real cost lever.
+
+`DEDUP_SIMHASH_DISTANCE` was set from measurement, not intuition: across the 65 real posts in `tests/fixtures`, four kinds of repost edit never exceeded 9 bits of difference and no unrelated pair came closer than 17. The default is 12, and a test re-derives it from the corpus so it cannot quietly rot.
+
 ---
 
 ## 3b. The Collection Gate (added after the fact — this plan originally missed it)
@@ -212,7 +235,7 @@ Steps 2–3 are worth doing regardless of which backend wins, which is why they 
 
 ## Open questions for you
 
-1. ~~**AI scope (§3):**~~ — deferred until storage is settled; no model is called anywhere yet.
+1. ~~**AI scope (§3):**~~ — built (see §3a). Runs model-free by default; setting `ANTHROPIC_API_KEY` is the only thing that turns extraction and model-cleaning on.
 2. **Telegram access:** Bot API (bots must be in the channel) or a user client (Telethon/MTProto, needs your account + API credentials)? This changes the adapter. Still open — collection currently reads the trial archive, not Telegram.
 3. **Confidence handling:** auto-escalate low-confidence Haiku extractions to Sonnet, or just flag them for human review?
 4. **SQLite's fate after Supabase** — see §12. Kept as the offline/test implementation behind the protocol, or removed once Supabase works?

@@ -25,6 +25,8 @@ import re
 from datetime import datetime
 
 from ..domain import RawPost
+from ..filtering.keywords import KEYWORD_PRODUCER, KEYWORD_VERSION
+from ..llm.protocol import Provenance
 from .views import (
     Field,
     ItemDetail,
@@ -139,9 +141,13 @@ class SupabaseStore:
                 item_id = int(row[0])
 
                 cur.executemany(
-                    "INSERT INTO structured_field (research_item_id, name, value, origin) "
-                    "VALUES (%s, 'keyword', %s, 'system')",
-                    [(item_id, keyword) for keyword in keywords],
+                    "INSERT INTO structured_field (research_item_id, name, value, origin, "
+                    "model, prompt_version) "
+                    "VALUES (%s, 'keyword', %s, 'system', %s, %s)",
+                    [
+                        (item_id, keyword, KEYWORD_PRODUCER, KEYWORD_VERSION)
+                        for keyword in keywords
+                    ],
                 )
                 cur.executemany(
                     "INSERT INTO media_asset (research_item_id, kind, storage_path, "
@@ -161,6 +167,125 @@ class SupabaseStore:
                     ],
                 )
         return True
+
+    # -- machine output, from the model stages ------------------------------
+
+    def set_cleaned_text(
+        self, item_id: int, cleaned_text: str, provenance: Provenance
+    ) -> None:
+        """Store a cleaned copy. The raw text is not touched.
+
+        Postgres enforces that the same way SQLite does -- a BEFORE UPDATE
+        trigger on raw_text (migrations/0002) -- so the guarantee survives the
+        backend swap rather than being a property of one of them.
+        """
+        self._require_item(item_id)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE research_item SET cleaned_text = %s, cleaned_by_model = %s, "
+                "cleaned_prompt_version = %s WHERE id = %s",
+                (cleaned_text, provenance.model, provenance.prompt_version, item_id),
+            )
+        self._conn.commit()
+
+    def add_machine_field(
+        self, item_id: int, name: str, value: str, provenance: Provenance
+    ) -> int:
+        """Record an extracted fact as origin='system', with its provenance."""
+        name, value = name.strip(), value.strip()
+        if not name or not value:
+            raise ValueError("a field needs both a name and a value")
+        self._require_item(item_id)
+
+        # See SqliteStore.add_machine_field: the same claim from the same
+        # producer under the same prompt version is the same row, so a re-run
+        # cannot double every extracted field. `is not distinct from` because
+        # the columns are nullable and `= NULL` never matches.
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM structured_field WHERE research_item_id = %s "
+                "AND name = %s AND value = %s AND origin = 'system' "
+                "AND model is not distinct from %s "
+                "AND prompt_version is not distinct from %s",
+                (item_id, name, value, provenance.model, provenance.prompt_version),
+            )
+            existing = cur.fetchone()
+            if existing is not None:
+                return int(existing[0])
+
+            cur.execute(
+                "INSERT INTO structured_field (research_item_id, name, value, origin, "
+                "model, prompt_version, confidence) "
+                "VALUES (%s, %s, %s, 'system', %s, %s, %s) RETURNING id",
+                (
+                    item_id,
+                    name,
+                    value,
+                    provenance.model,
+                    provenance.prompt_version,
+                    provenance.confidence,
+                ),
+            )
+            new_id = int(cur.fetchone()[0])
+        self._conn.commit()
+        return new_id
+
+    def set_simhash(self, item_id: int, value: str) -> None:
+        """Record the near-duplicate fingerprint (plan §7 tier 2). No model."""
+        self._require_item(item_id)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE research_item SET simhash = %s WHERE id = %s", (value, item_id)
+            )
+        self._conn.commit()
+
+    def items_needing(
+        self, prompt_version: str, *, limit: int | None = None
+    ) -> list[tuple[int, str]]:
+        """Items this prompt version has not cleaned yet, oldest first.
+
+        `is distinct from` rather than `<>`: an item never cleaned has a NULL
+        version, and `<> 'clean-1'` on NULL is NULL, which would silently drop
+        exactly the items the run exists to process.
+        """
+        sql = (
+            "SELECT id, raw_text FROM research_item "
+            "WHERE cleaned_prompt_version is distinct from %s ORDER BY id"
+        )
+        params: tuple = (prompt_version,)
+        if limit is not None:
+            sql += " LIMIT %s"
+            params = (prompt_version, limit)
+        with self._conn.cursor() as cur:
+            cur.execute(sql, params)
+            return [(int(row[0]), row[1]) for row in cur.fetchall()]
+
+    def untraceable_system_fields(self) -> int:
+        """How many machine fields predate the provenance requirement."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM structured_field WHERE origin = 'system' "
+                "AND (model IS NULL OR prompt_version IS NULL)"
+            )
+            return int(cur.fetchone()[0])
+
+    def backfill_keyword_provenance(self) -> int:
+        """Attribute pre-existing keyword fields to the gate that produced them.
+
+        migrations/0002 adds the traceability constraint NOT VALID so an
+        existing table is not rejected outright. Running this is what makes it
+        safe to then VALIDATE it. Deliberately never automatic -- it edits
+        stored rows.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE structured_field SET model = %s, prompt_version = %s "
+                "WHERE name = 'keyword' AND origin = 'system' AND model IS NULL",
+                (KEYWORD_PRODUCER, KEYWORD_VERSION),
+            )
+            updated = cur.rowcount
+        self._conn.commit()
+        return updated
 
     # -- human input, from the review interface -----------------------------
 

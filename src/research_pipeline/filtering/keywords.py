@@ -32,6 +32,15 @@ RU_NOUN_ENDINGS: tuple[str, ...] = (
 MATCH_WHOLE_WORD = "whole-word"
 MATCH_SUBSTRING = "substring"
 
+# A matched keyword is stored as a Structured Field with origin='system', so it
+# needs provenance like any other machine output: which producer decided it,
+# under which rules. There is no model involved -- that is the point of the
+# gate -- so the producer names itself. Bump the version when the matching
+# rules change, not when the keyword list does: the list is the human's input
+# to these rules, and it is already stored as the values themselves.
+KEYWORD_PRODUCER = "keyword-gate"
+KEYWORD_VERSION = "keyword-1"
+
 
 class KeywordHit(NamedTuple):
     """One keyword occurrence found in a post."""
