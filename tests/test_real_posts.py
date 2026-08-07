@@ -89,6 +89,7 @@ def test_fixture_covers_the_bare_form_of_every_keyword_present():
         "крео",
         "креос",
         "кейс",
+        "залив",
     }
     for keyword in FIXTURE["config"]["keywords"]:
         inflected = {f for f in covered if f.startswith(keyword)}

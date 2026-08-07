@@ -5,8 +5,10 @@ from .keywords import (
     KeywordHit,
     normalize,
 )
+from .scope import ChannelScope
 
 __all__ = [
+    "ChannelScope",
     "Decision",
     "KeywordFilter",
     "KeywordFilterConfig",

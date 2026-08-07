@@ -18,6 +18,7 @@ import pytest
 
 from research_pipeline.domain import RawMedia, RawPost, RawSource
 from research_pipeline.filtering import (
+    ChannelScope,
     KeywordFilter,
     KeywordFilterConfig,
     KeywordGate,
@@ -26,15 +27,26 @@ from research_pipeline.filtering import (
 from research_pipeline.pipeline import ingest
 from research_pipeline.storage.sqlite_store import SqliteStore
 
-KEYWORDS = ("креатив", "креативчик", "крео", "креос", "кейс")
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "real_posts.json").read_text(encoding="utf-8")
 )
 
+# Taken from the fixture rather than written out here. The real-post tests at
+# the bottom of this module judge posts the fixture filed as matching, and the
+# fixture is cut with whatever INGEST_KEYWORDS says -- so a hardcoded list
+# silently disagrees with it the first time a keyword is added, and the failure
+# looks like a broken pipeline instead of a stale constant.
+KEYWORD_CONFIG = KeywordFilterConfig(
+    keywords=tuple(FIXTURE["config"]["keywords"]),
+    match=FIXTURE["config"]["match"],
+    allow_russian_inflections=FIXTURE["config"]["allow_russian_inflections"],
+)
+KEYWORDS = KEYWORD_CONFIG.keywords
+
 
 @pytest.fixture
 def gate() -> KeywordGate:
-    return KeywordGate(KeywordFilter(KeywordFilterConfig(keywords=KEYWORDS)))
+    return KeywordGate(KeywordFilter(KEYWORD_CONFIG))
 
 
 @pytest.fixture
@@ -43,9 +55,11 @@ def store(tmp_path: Path) -> SqliteStore:
         yield s
 
 
-def post(text: str | None, external_id: str = "chat:1", **kw) -> RawPost:
+def post(
+    text: str | None, external_id: str = "chat:1", channel: str = "chat", **kw
+) -> RawPost:
     return RawPost(
-        source=RawSource(platform="telegram", platform_id="chat", title="Test"),
+        source=RawSource(platform="telegram", platform_id=channel, title="Test"),
         external_id=external_id,
         text=text,
         posted_at=datetime(2026, 1, 1, 12, 0),
@@ -85,6 +99,108 @@ def test_gate_separates_media_only_posts_from_rejected_ones(gate, text):
 def test_gate_rejects_compounds(gate):
     assert not gate.evaluate(post("антикейс на 1 500 000")).collect
     assert not gate.evaluate(post("видео-креативов много")).collect
+
+
+# --------------------------------------------------------------------------
+# The channel scope: where the gate is allowed to look
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def scoped_gate() -> KeywordGate:
+    """A gate restricted to one channel, so out-of-scope has something to mean."""
+    return KeywordGate(
+        KeywordFilter(KEYWORD_CONFIG),
+        ChannelScope(channels=("-100tracked",)),
+    )
+
+
+def test_scope_collects_from_a_tracked_channel(scoped_gate):
+    decision = scoped_gate.evaluate(post("свежий креатив", channel="-100tracked"))
+    assert decision.collect
+    assert decision.keywords == ("креатив",)
+
+
+def test_scope_rejects_an_untracked_channel_even_with_a_keyword(scoped_gate):
+    """The point of the rule: a keyword cannot buy a post its way in.
+
+    This is what distinguishes the scope from an optimisation -- the post would
+    have been collected on text alone, and is refused on origin.
+    """
+    decision = scoped_gate.evaluate(post("свежий креатив", channel="-100other"))
+    assert not decision.collect
+    assert decision.verdict is Verdict.OUT_OF_SCOPE
+    assert decision.keywords == ()
+
+
+def test_out_of_scope_is_not_reported_as_no_keyword(scoped_gate, store):
+    """Rejection reasons stay separate, so 'is my keyword list too narrow?'
+    is still answerable after a channel is swapped."""
+    posts = [
+        post("свежий креатив", "a", channel="-100tracked"),
+        post("свежий креатив", "b", channel="-100other"),
+        post("ничего интересного", "c", channel="-100tracked"),
+    ]
+    result = ingest(ListSource(posts), scoped_gate, store)
+
+    assert result.rejected == {"out-of-scope": 1, "no-keyword": 1}
+    assert store.count_items() == 1
+
+
+def test_untracked_channel_never_reaches_storage(scoped_gate, store):
+    heavy = post(
+        "креатив с видео",
+        channel="-100other",
+        media=(RawMedia(kind="video", path="/x.mp4", size_bytes=50_000_000),),
+    )
+    ingest(ListSource([heavy]), scoped_gate, store)
+
+    assert store.count_items() == 0
+    assert store._conn.execute("SELECT COUNT(*) FROM media_asset").fetchone()[0] == 0
+
+
+def test_an_unset_scope_reads_every_channel(gate):
+    """The default has to stay unrestricted, or adding this rule would
+    silently stop collection for every run that predates it."""
+    assert not gate.scope.restricted
+    for channel in ("-100a", "-100b", "anything"):
+        assert gate.evaluate(post("креатив", channel=channel)).collect
+
+
+def test_counts_add_up_across_channels(scoped_gate, store):
+    posts = [
+        post("креатив", "a", channel="-100tracked"),
+        post("кейс", "b", channel="-100other"),
+        post(None, "c", channel="-100tracked"),
+        post("ничего", "d", channel="-100tracked"),
+        post("креатив", "e", channel="-100third"),
+    ]
+    result = ingest(ListSource(posts), scoped_gate, store)
+
+    assert result.seen == result.collected + sum(result.rejected.values())
+    assert result.rejected == {"out-of-scope": 2, "no-text": 1, "no-keyword": 1}
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("-1001,-1002", ("-1001", "-1002")),
+        ("  -1001 , -1002  ", ("-1001", "-1002")),
+        ("-1001,,", ("-1001",)),
+        ("", ()),
+        ("   ", ()),
+    ],
+)
+def test_scope_parses_from_env(raw, expected):
+    scope = ChannelScope.from_env({"INGEST_CHANNELS": raw})
+    assert scope.channels == expected
+    assert scope.restricted is bool(expected)
+
+
+def test_scope_label_names_the_unrestricted_case():
+    """An empty scope must announce itself, not print an empty string."""
+    assert "unset" in ChannelScope.from_env({}).label
+    assert ChannelScope(channels=("-1001", "-1002")).label == "-1001, -1002"
 
 
 # --------------------------------------------------------------------------

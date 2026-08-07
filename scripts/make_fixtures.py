@@ -70,6 +70,51 @@ def merge_records(previous: list[dict], fresh: list[dict]) -> list[dict]:
     return fresh + [r for r in previous if key(r) not in seen]
 
 
+def reclassify(
+    record: dict, strict: KeywordFilter, loose: KeywordFilter
+) -> tuple[str, dict]:
+    """Re-derive a carried-over record's bucket and expectations.
+
+    A frozen excerpt outlives the keyword list it was cut under. Adding one
+    keyword can move a post from non_matching to matching, and can add a form
+    to one already in matching -- so carrying a record across verbatim would
+    keep asserting the old answer while the fixture's config block advertises
+    the new one, and the two would contradict each other.
+
+    Everything is recomputed from the stored excerpt, never from the original
+    post, which is the same self-consistency rule the fresh records follow.
+    """
+    text = record.get("text", "")
+    base = {k: record[k] for k in ("msg_id", "channel", "date") if k in record}
+
+    hits = strict.find(text)
+    if hits:
+        return "matching", {
+            **base,
+            "text": text,
+            "expect_keywords": strict.matched_keywords(text),
+            "expect_forms": sorted({h.matched_text for h in hits}),
+        }
+
+    loose_hits = loose.find(text)
+    if loose_hits:
+        hit = loose_hits[0]
+        return "near_miss", {
+            **base,
+            "text": text,
+            "substring_keyword": hit.keyword,
+            # The original context was cut from the full post, which a carried
+            # record no longer has. Keep it when it survived, else re-cut from
+            # the excerpt so the field never goes missing.
+            "context": record.get(
+                "context",
+                normalize(text)[max(0, hit.start - 20) : hit.end + 20].strip(),
+            ),
+        }
+
+    return "non_matching", {**base, "text": text}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="tests/fixtures/real_posts.json")
@@ -164,9 +209,21 @@ def main() -> int:
     out_path = root / args.out
     if args.merge and out_path.exists():
         previous = json.loads(out_path.read_text(encoding="utf-8"))
-        matching = merge_records(previous.get("matching", []), matching)
-        non_matching = merge_records(previous.get("non_matching", []), non_matching)
-        near_miss = merge_records(previous.get("near_miss", []), near_miss)
+        # Re-bucket before merging: a carried record's bucket is a claim about
+        # the current keyword list, not a property of the post.
+        carried: dict[str, list[dict]] = {
+            "matching": [],
+            "non_matching": [],
+            "near_miss": [],
+        }
+        for bucket in ("matching", "non_matching", "near_miss"):
+            for record in previous.get(bucket, []):
+                target, rebuilt = reclassify(record, strict, loose)
+                carried[target].append(rebuilt)
+
+        matching = merge_records(carried["matching"], matching)
+        non_matching = merge_records(carried["non_matching"], non_matching)
+        near_miss = merge_records(carried["near_miss"], near_miss)
 
     fixture = {
         "_comment": (

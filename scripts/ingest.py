@@ -26,6 +26,7 @@ from research_pipeline.config import (  # noqa: E402
 from research_pipeline.domain import RawPost  # noqa: E402
 from research_pipeline.env import load_project_env  # noqa: E402
 from research_pipeline.filtering import (  # noqa: E402
+    ChannelScope,
     KeywordFilter,
     KeywordFilterConfig,
     KeywordGate,
@@ -79,7 +80,10 @@ def main() -> int:
         print("TRIAL_DB_PATH is not set (see .env.example)", file=sys.stderr)
         return 1
 
-    gate = KeywordGate(KeywordFilter(KeywordFilterConfig.from_env()))
+    gate = KeywordGate(
+        KeywordFilter(KeywordFilterConfig.from_env()),
+        ChannelScope.from_env(),
+    )
     source = ArchiveSource(root / archive)
 
     try:
@@ -90,6 +94,7 @@ def main() -> int:
 
     store = DryRunStore() if args.dry_run else open_collection_store(storage)
 
+    print(f"channels : {gate.scope.label}")
     print(f"keywords : {', '.join(gate.keywords)}")
     print(f"source   : {archive}")
     print(f"target   : {'(dry run -- nothing written)' if args.dry_run else storage.label}")
